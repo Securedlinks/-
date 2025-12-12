@@ -1,0 +1,765 @@
+local function initAutoFarmTab(Window, syde)
+    if not Window then
+        print("Window is nil, cannot initialize Auto Farm tab")
+        return
+    end
+
+    if not Window.InitTab then
+        print("Window.InitTab is nil, UI library not loaded properly")
+        return
+    end
+
+    if not game then
+        print("Game is not available")
+        return
+    end
+
+    -- Check place ID for game-specific modifications
+    local placeId = game.PlaceId
+    local isForgeWorld2 = (placeId == 129009554587176)
+
+    -- Anti-idle function to prevent kick
+    local speaker = game.Players.LocalPlayer
+    if speaker and speaker.Idled then
+        if getconnections then
+            for _, connection in pairs(getconnections(speaker.Idled)) do
+                if connection["Disable"] then
+                    connection["Disable"](connection)
+                elseif connection["Disconnect"] then
+                    connection["Disconnect"](connection)
+                end
+            end
+        else
+            speaker.Idled:Connect(function()
+                game:GetService("VirtualUser"):CaptureController()
+                game:GetService("VirtualUser"):ClickButton2(Vector2.new())
+            end)
+        end
+    end
+
+    local RunService = game:GetService("RunService")
+    local Players = game:GetService("Players")
+    local TweenService = game:GetService("TweenService")
+
+    local AutoFarmTab = Window:InitTab({ Title = 'Auto Farm' })
+
+    -- Farming variables
+    local movementSpeed = 16
+    local distanceOffset = 5
+    local heightOffset = 0
+    local skyHeight = 120
+    local maxHeight = 250
+    local teleportDownThreshold = 4 -- horizontal XZ threshold to teleport down when above mob (in studs)
+    local postKillUpHeight = 100 -- studs to teleport up after killing a mob in Teleport mode
+    local farmingMode = 'Tween'
+    local lookAtMobEnabled = false
+
+    -- Mob lists for different worlds
+    local world1Mobs = {
+        "Zombie",
+        "Elite Zombie",
+        "Delver Zombie",
+        "Brute Zombie"
+    }
+
+    local world2Mobs = {
+        "Bomber",
+        "Skeleton Rogue",
+        "Axe Skeleton",
+        "Deathaxe Skeleton",
+        "Elite Rogue Skeleton",
+        "Elite Deathaxe Skeleton",
+        "Reaper",
+        "Slime",
+        "Blazing Slime"
+    }
+
+    -- Mob selection variables
+    local priorityMobs1 = {}
+    local priorityMobs2 = {}
+    local priorityMobs3 = {}
+    local otherMobs = {}
+
+    -- Auto Kill variable
+    local autoKillEnabled = false
+
+    -- Auto Kill connections and tweens
+    local autoKillConnection = nil
+    local currentMobTween = nil
+    local noclipConnection = nil
+    local followLockConnection = nil
+    local followLockTween = nil
+    local followLockPrevWalkSpeed = nil
+    local followLockPrevPlatformStand = nil
+    local deathConnection = nil
+
+    -- Positioning control
+    local lastPositionedMob = nil
+    local currentTargetSkyY = nil
+
+    -- Weapon variables
+    local equippedWeapon = nil
+
+    -- Equip weapon function
+    local function equipWeaponFromHotbar()
+        pcall(function()
+            local player = Players.LocalPlayer
+            if not player or not player.Backpack or not player.Character then return end
+            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+            if not humanoid then return end
+            -- Find weapon tool in backpack
+            for _, tool in pairs(player.Backpack:GetChildren()) do
+                if tool:IsA("Tool") and tool.Name == "Weapon" then
+                    humanoid:EquipTool(tool)
+                    wait(0.1)
+                    local equippedTool = player.Character:FindFirstChildWhichIsA("Tool")
+                    if equippedTool then
+                        equippedWeapon = equippedTool
+                    end
+                    return
+                end
+            end
+        end)
+    end
+
+    -- Mob detection function
+    local function findClosestMobInZone(selectedMobs)
+        local living = workspace:FindFirstChild("Living")
+        if not living then return nil end
+
+        local player = Players.LocalPlayer
+        if not player or not player.Character then return nil end
+
+        local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return nil end
+
+        local closestMob = nil
+        local closestDistance = math.huge
+
+        for _, mobModel in pairs(living:GetChildren()) do
+            if mobModel:IsA("Model") and mobModel:GetAttribute("IsNpc") then
+                -- Check if mob is alive
+                local mobHumanoid = mobModel:FindFirstChildOfClass("Humanoid")
+                if not mobHumanoid or mobHumanoid.Health <= 0 then
+                    continue
+                end
+
+                local mobName = mobModel.Name
+                -- Strip numbers from end of name (e.g., "Zombie12345" -> "Zombie")
+                local baseName = string.lower( (mobName:match("^(.-)%d*$") or mobName):gsub("%s+", "") )
+
+                -- Check if mob matches selection criteria
+                local mobMatches = false
+                if #selectedMobs == 0 then
+                    -- No specific mobs selected, accept any mob
+                    mobMatches = true
+                else
+                    -- Check if this mob is in the selected list
+                    for _, selectedName in ipairs(selectedMobs) do
+                        local cleanSelected = string.lower(selectedName:gsub("%s+", ""))
+                        if baseName == cleanSelected then
+                            mobMatches = true
+                            break
+                        end
+                    end
+                end
+
+                if mobMatches then
+                    local mobPivot = mobModel:GetPivot()
+                    if mobPivot then
+                        local distance = (mobPivot.Position - hrp.Position).Magnitude
+                        if distance < closestDistance then
+                            closestDistance = distance
+                            closestMob = mobModel
+                        end
+                    end
+                end
+            end
+        end
+
+        return closestMob
+    end
+
+    -- Auto Kill functions
+    local function stopAutoKill()
+        if autoKillConnection then
+            autoKillConnection:Disconnect()
+            autoKillConnection = nil
+        end
+        if currentMobTween then
+            currentMobTween:Cancel()
+            currentMobTween = nil
+        end
+        if followLockTween then
+            followLockTween:Cancel()
+            followLockTween = nil
+        end
+        if noclipConnection then
+            noclipConnection:Disconnect()
+            noclipConnection = nil
+        end
+        -- Reset camera
+        local camera = workspace.CurrentCamera
+        camera.CameraType = Enum.CameraType.Custom
+        camera.CameraSubject = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        -- Reset positioning state
+        lastPositionedMob = nil
+        currentTargetSkyY = nil
+        -- Disconnect follow lock if active
+        if followLockConnection then
+            followLockConnection:Disconnect()
+            followLockConnection = nil
+        end
+        -- Disconnect death connection if active
+        if deathConnection then
+            deathConnection:Disconnect()
+            deathConnection = nil
+        end
+        -- Restore humanoid state if we changed it
+        pcall(function()
+            local pl = Players.LocalPlayer
+            if pl and pl.Character then
+                local humanoid = pl.Character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    humanoid.WalkSpeed = followLockPrevWalkSpeed or humanoid.WalkSpeed
+                    humanoid.PlatformStand = followLockPrevPlatformStand or humanoid.PlatformStand
+                    followLockPrevWalkSpeed = nil
+                    followLockPrevPlatformStand = nil
+                end
+            end
+        end)
+    end
+
+    local function startAutoKill()
+        stopAutoKill()
+
+        -- Enable noclip
+        noclipConnection = RunService.Stepped:Connect(function()
+            pcall(function()
+                local player = Players.LocalPlayer
+                local character = player.Character
+                if not character then return end
+
+                local humanoid = character:FindFirstChild("Humanoid")
+                if humanoid then
+                    humanoid.PlatformStand = false
+                end
+
+                -- Disable collision on ALL parts
+                for _, part in pairs(character:GetDescendants()) do
+                    if part:IsA("BasePart") or part:IsA("Part") or part:IsA("MeshPart") then
+                        part.CanCollide = false
+                        part.Velocity = Vector3.new(0, 0, 0)
+                        part.RotVelocity = Vector3.new(0, 0, 0)
+                    end
+                end
+
+                -- Also disable collision on accessories
+                for _, accessory in pairs(character:GetChildren()) do
+                    if accessory:IsA("Accessory") then
+                        local handle = accessory:FindFirstChild("Handle")
+                        if handle and handle:IsA("BasePart") then
+                            handle.CanCollide = false
+                        end
+                    end
+                end
+            end)
+        end)
+
+        -- Equip weapon
+        equipWeaponFromHotbar()
+
+        -- Attach death handler to restart AutoKill after 5 seconds when player dies
+        if deathConnection then
+            deathConnection:Disconnect()
+            deathConnection = nil
+        end
+        do
+            local pl = Players.LocalPlayer
+            if pl and pl.Character then
+                local hum = pl.Character:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    deathConnection = hum.Died:Connect(function()
+                        -- Stop current auto kill and follow locks
+                        stopAutoKill()
+
+                        -- Wait a small delay before trying to restart
+                        wait(5)
+
+                        -- Attempt restart if autoKillEnabled still true
+                        if autoKillEnabled then
+                            -- Wait for a new character to exist and have a HRP
+                            local tries = 0
+                            while tries < 100 and (not pl.Character or not pl.Character:FindFirstChild("HumanoidRootPart")) do
+                                wait(0.1)
+                                tries = tries + 1
+                            end
+                            if autoKillEnabled then
+                                -- Equip weapon after respawn and before starting AutoKill
+                                pcall(function()
+                                    equipWeaponFromHotbar()
+                                end)
+                                wait(0.15)
+                                startAutoKill()
+                            end
+                        end
+                    end)
+                end
+            end
+        end
+
+        autoKillConnection = RunService.Heartbeat:Connect(function()
+            if not autoKillEnabled then return end
+
+            pcall(function()
+                local player = Players.LocalPlayer
+                local character = player.Character
+                if not character then return end
+
+                local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+                local humanoid = character:FindFirstChild("Humanoid")
+                if not humanoid or not humanoidRootPart then return end
+
+                -- Handle camera for Look At Mob
+                local camera = workspace.CurrentCamera
+                if lookAtMobEnabled then
+                    camera.CameraType = Enum.CameraType.Follow
+                    local closestMob = findClosestMobInZone(priorityMobs1) or findClosestMobInZone(priorityMobs2) or findClosestMobInZone(priorityMobs3) or findClosestMobInZone(otherMobs)
+                    if closestMob then
+                        local mobHumanoid = closestMob:FindFirstChildOfClass("Humanoid")
+                        if mobHumanoid then
+                            camera.CameraSubject = mobHumanoid
+                        end
+                    end
+                else
+                    camera.CameraType = Enum.CameraType.Custom
+                    camera.CameraSubject = humanoid
+                end
+
+                -- Find closest mob
+                local closestMob = findClosestMobInZone(priorityMobs1)
+                if not closestMob then
+                    closestMob = findClosestMobInZone(priorityMobs2)
+                end
+                if not closestMob then
+                    closestMob = findClosestMobInZone(priorityMobs3)
+                end
+                if not closestMob then
+                    closestMob = findClosestMobInZone(otherMobs)
+                end
+
+                if closestMob then
+                    -- Check if mob is still alive
+                    local mobHumanoid = closestMob:FindFirstChildOfClass("Humanoid")
+                    if not mobHumanoid or mobHumanoid.Health <= 0 then
+                        lastPositionedMob = nil  -- Reset for new mob
+                        currentTargetSkyY = nil
+                        return
+                    end
+
+                    -- Only position if not already positioned for this mob
+                    if closestMob ~= lastPositionedMob then
+                        -- Cancel any existing tween
+                        if currentMobTween then
+                            currentMobTween:Cancel()
+                            currentMobTween = nil
+                        end
+
+                        local mobPivot = closestMob:GetPivot()
+                        local mobPosition = mobPivot.Position
+                        local mobLookVector = mobPivot.LookVector
+
+                        -- Target position: in front of mob's facing direction, with offsets
+                        local targetPosition = mobPosition + (mobLookVector * distanceOffset) + Vector3.new(0, heightOffset, 0)
+
+                        -- Calculate distance to target
+                        local distance = (targetPosition - humanoidRootPart.Position).Magnitude
+
+                        if farmingMode == 'Tween' then
+                            if distance > 20 then
+                                -- Tween to target
+                                local tweenTime = math.max(distance / movementSpeed, 0.1)
+                                currentMobTween = TweenService:Create(humanoidRootPart, TweenInfo.new(tweenTime, Enum.EasingStyle.Linear), {CFrame = CFrame.new(targetPosition, mobPosition)})
+                                currentMobTween:Play()
+                            else
+                                -- Teleport if close
+                                humanoidRootPart.CFrame = CFrame.new(targetPosition, mobPosition)
+                            end
+                        elseif farmingMode == 'Teleport' then
+                            -- Calculate sky height
+                            local currentPos = humanoidRootPart.Position
+                            local targetSkyHeight = currentTargetSkyY or (currentPos.Y + skyHeight + heightOffset)
+                            -- Cap sky height by maxHeight
+                            if targetSkyHeight > maxHeight then
+                                targetSkyHeight = maxHeight
+                            end
+                            -- Also cap sky height relative to the mob position to avoid huge drops
+                            if targetSkyHeight > mobPosition.Y + 160 then
+                                targetSkyHeight = mobPosition.Y + 160
+                            end
+                            -- If we already have a recorded elevated Y (post-kill) and we're already at/above it, skip teleport up
+                            local atOrAbove = humanoidRootPart.Position.Y >= targetSkyHeight - 0.5
+
+
+                            -- Teleport up to sky height if we're below it
+                            local skyPos = Vector3.new(currentPos.X, targetSkyHeight, currentPos.Z)
+                            if humanoidRootPart.Position.Y < targetSkyHeight - 0.5 then
+                                humanoidRootPart.CFrame = CFrame.new(skyPos)
+                                humanoidRootPart.Velocity = Vector3.new(0, 0, 0)
+                                humanoidRootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                humanoidRootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                                wait(0.15)
+                            end
+
+                            -- Tween horizontally to above target at sky height while keeping distance offset
+                            local targetHoriz = Vector3.new(mobPosition.X, targetSkyHeight, mobPosition.Z) + (mobLookVector * distanceOffset)
+                            local horizDistance = (targetHoriz - humanoidRootPart.Position).Magnitude
+                            if horizDistance > 0.05 then
+                                local horizTime = math.max(horizDistance / movementSpeed, 0.1)
+                                currentMobTween = TweenService:Create(humanoidRootPart, TweenInfo.new(horizTime, Enum.EasingStyle.Linear), {CFrame = CFrame.new(targetHoriz, mobPosition)})
+                                currentMobTween:Play()
+                                currentMobTween.Completed:Wait()
+                            end
+
+                            -- If horizontally over the hover target after tween (XZ distance small), teleport down to final target
+                            local targetXZ = Vector3.new(targetHoriz.X, 0, targetHoriz.Z)
+                            local currentXZ = Vector3.new(humanoidRootPart.Position.X, 0, humanoidRootPart.Position.Z)
+                            local horizXZ = targetXZ - currentXZ
+                            if horizXZ.Magnitude <= teleportDownThreshold then
+                                -- Compute target final position (use targetHoriz.XZ and mob yaw) and clamp drop <= 160
+                                local finalTargetY = mobPosition.Y + heightOffset
+                                local currentY = humanoidRootPart.Position.Y
+                                if currentY - finalTargetY > 160 then
+                                    finalTargetY = currentY - 160
+                                end
+                                local finalTarget = Vector3.new(targetHoriz.X, finalTargetY, targetHoriz.Z)
+                                if followLockTween then followLockTween:Cancel(); followLockTween = nil end
+                                humanoidRootPart.CFrame = CFrame.new(finalTarget, mobPosition)
+                                humanoidRootPart.Velocity = Vector3.new(0, 0, 0)
+                                humanoidRootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                humanoidRootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                                -- Start follow lock to stay in front of the mob
+                                if followLockConnection then
+                                    followLockConnection:Disconnect()
+                                    followLockConnection = nil
+                                end
+                                pcall(function()
+                                    local humanoid = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                                    if humanoid then
+                                        followLockPrevWalkSpeed = humanoid.WalkSpeed
+                                        followLockPrevPlatformStand = humanoid.PlatformStand
+                                        humanoid.PlatformStand = true
+                                        humanoid.WalkSpeed = 0
+                                    end
+                                end)
+                                followLockConnection = RunService.Heartbeat:Connect(function()
+                                    if not autoKillEnabled or not closestMob or not closestMob.Parent then
+                                        if followLockConnection then
+                                            followLockConnection:Disconnect()
+                                            followLockConnection = nil
+                                        end
+                                        pcall(function()
+                                            local humanoid = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                                            if humanoid then
+                                                humanoid.WalkSpeed = followLockPrevWalkSpeed or humanoid.WalkSpeed
+                                                humanoid.PlatformStand = followLockPrevPlatformStand or humanoid.PlatformStand
+                                                followLockPrevWalkSpeed = nil
+                                                followLockPrevPlatformStand = nil
+                                            end
+                                        end)
+                                        return
+                                    end
+                                    local updatedPivotLocal = closestMob:GetPivot()
+                                    local hrp = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                                    if updatedPivotLocal and hrp then
+                                        local desiredPosLocal = updatedPivotLocal.Position + (updatedPivotLocal.LookVector * distanceOffset) + Vector3.new(0, heightOffset, 0)
+                                        local currentPosLocal = hrp.Position
+                                        local followDistLocal = (desiredPosLocal - currentPosLocal).Magnitude
+                                        if followDistLocal > 0.05 then
+                                            if followLockTween then followLockTween:Cancel(); followLockTween = nil end
+                                            local tweenTimeLocal = math.max(followDistLocal / movementSpeed, 0.05)
+                                            followLockTween = TweenService:Create(hrp, TweenInfo.new(tweenTimeLocal, Enum.EasingStyle.Linear), {CFrame = CFrame.new(desiredPosLocal, updatedPivotLocal.Position)})
+                                            followLockTween:Play()
+                                        end
+                                    end
+                                end)
+                                currentTargetSkyY = nil
+                            end
+
+                            -- Record sky height for this mob
+                            currentTargetSkyY = targetSkyHeight
+                        end
+
+                        lastPositionedMob = closestMob  -- Mark as positioned
+                    end
+
+                    -- Attack if close horizontally to target (ignores vertical distance)
+                    local desiredTarget = targetPosition
+                    if closestMob and closestMob.Parent then
+                        local mobPivotNow = closestMob:GetPivot()
+                        if mobPivotNow then
+                            desiredTarget = mobPivotNow.Position + (mobPivotNow.LookVector * distanceOffset) + Vector3.new(0, heightOffset, 0)
+                        end
+                    end
+                    local horizontalDistance = (Vector3.new(desiredTarget.X, 0, desiredTarget.Z) - Vector3.new(humanoidRootPart.Position.X, 0, humanoidRootPart.Position.Z)).Magnitude
+                    if horizontalDistance < 10 then
+                        pcall(function()
+                            local args = {"Weapon"}
+                            game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Packages"):WaitForChild("Knit"):WaitForChild("Services"):WaitForChild("ToolService"):WaitForChild("RF"):WaitForChild("ToolActivated"):InvokeServer(table.unpack(args))
+                        end)
+                    end
+                    spawn(function()
+                        while autoKillEnabled and closestMob and closestMob.Parent do
+                            local mobHumanoid = closestMob:FindFirstChildOfClass("Humanoid")
+                            if not mobHumanoid or mobHumanoid.Health <= 0 then 
+                                if currentMobTween then
+                                    currentMobTween:Cancel()
+                                    currentMobTween = nil
+                                end
+                                -- If follow lock exists, disconnect and restore humanoid state
+                                if followLockConnection then
+                                    followLockConnection:Disconnect()
+                                    followLockConnection = nil
+                                    pcall(function()
+                                        local humanoid = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                                        if humanoid then
+                                            humanoid.WalkSpeed = followLockPrevWalkSpeed or humanoid.WalkSpeed
+                                            humanoid.PlatformStand = followLockPrevPlatformStand or humanoid.PlatformStand
+                                            followLockPrevWalkSpeed = nil
+                                            followLockPrevPlatformStand = nil
+                                        end
+                                    end)
+                                end
+
+                                -- If Teleport mode, teleport up after kill and record sky Y for next target
+                                if farmingMode == 'Teleport' then
+                                    local postUpPos = humanoidRootPart.Position + Vector3.new(0, postKillUpHeight, 0)
+                                    humanoidRootPart.CFrame = CFrame.new(postUpPos)
+                                    humanoidRootPart.Velocity = Vector3.new(0,0,0)
+                                    humanoidRootPart.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                                    humanoidRootPart.AssemblyAngularVelocity = Vector3.new(0,0,0)
+                                    currentTargetSkyY = postUpPos.Y
+                                    -- reset lastPositionedMob so loop will find next mob
+                                    lastPositionedMob = nil
+                                    wait(0.1)
+                                else
+                                    -- Reset for next mob
+                                    lastPositionedMob = nil
+                                    currentTargetSkyY = nil
+                                end
+                                break 
+                            end
+                            wait(0.1)
+                            if not autoKillEnabled then break end
+                            local updatedPivot = closestMob:GetPivot()
+                            if updatedPivot then
+                                local updatedPosition = updatedPivot.Position + (updatedPivot.LookVector * distanceOffset) + Vector3.new(0, heightOffset, 0)
+                                local updatedDistance = (updatedPosition - humanoidRootPart.Position).Magnitude
+                                if updatedDistance > 1 then
+                                    if farmingMode == 'Tween' then
+                                        if updatedDistance > 20 then
+                                            local tweenTime = math.max(updatedDistance / movementSpeed, 0.1)
+                                            currentMobTween = TweenService:Create(humanoidRootPart, TweenInfo.new(tweenTime, Enum.EasingStyle.Linear), {CFrame = CFrame.new(updatedPosition, updatedPivot.Position)})
+                                            currentMobTween:Play()
+                                        else
+                                            humanoidRootPart.CFrame = CFrame.new(updatedPosition, updatedPivot.Position)
+                                        end
+                                    elseif farmingMode == 'Teleport' then
+                                        -- For following in teleport mode, tween to updated position but keep Y at the recorded sky height
+                                        local followY = currentTargetSkyY or (updatedPivot.Position.Y + heightOffset)
+                                        local followPos = Vector3.new(updatedPivot.Position.X, followY, updatedPivot.Position.Z) + (updatedPivot.LookVector * distanceOffset)
+
+                                        -- Check horizontal XZ distance to decide if we should teleport down (compare to followPos)
+                                        local targetXZ = Vector3.new(followPos.X, 0, followPos.Z)
+                                        local currentXZ = Vector3.new(humanoidRootPart.Position.X, 0, humanoidRootPart.Position.Z)
+                                        local horizXZ = targetXZ - currentXZ
+                                        if horizXZ.Magnitude <= teleportDownThreshold then
+                                            -- Teleport down to target but restrict drop <=160
+                                            local finalTargetY = updatedPivot.Position.Y + heightOffset
+                                            local currentY = humanoidRootPart.Position.Y
+                                            if currentY - finalTargetY > 160 then
+                                                finalTargetY = currentY - 160
+                                            end
+                                            local finalTarget = Vector3.new(followPos.X, finalTargetY, followPos.Z)
+                                            -- apply facing offset using pivot look vector (already included in followPos), but ensure constant distance offset
+                                            if followLockTween then followLockTween:Cancel(); followLockTween = nil end
+                                            humanoidRootPart.CFrame = CFrame.new(finalTarget, updatedPivot.Position)
+                                            humanoidRootPart.Velocity = Vector3.new(0, 0, 0)
+                                            humanoidRootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                            humanoidRootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                                            -- Start follow lock to remain in front of the mob
+                                            if followLockConnection then
+                                                followLockConnection:Disconnect()
+                                                followLockConnection = nil
+                                            end
+                                            pcall(function()
+                                                local humanoid = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                                                if humanoid then
+                                                    followLockPrevWalkSpeed = humanoid.WalkSpeed
+                                                    followLockPrevPlatformStand = humanoid.PlatformStand
+                                                    humanoid.PlatformStand = true
+                                                    humanoid.WalkSpeed = 0
+                                                end
+                                            end)
+                                            followLockConnection = RunService.Heartbeat:Connect(function()
+                                                if not autoKillEnabled or not closestMob or not closestMob.Parent then
+                                                    if followLockConnection then
+                                                        followLockConnection:Disconnect()
+                                                        followLockConnection = nil
+                                                    end
+                                                    if followLockTween then followLockTween:Cancel(); followLockTween = nil end
+                                                    pcall(function()
+                                                        local humanoid = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                                                        if humanoid then
+                                                            humanoid.WalkSpeed = followLockPrevWalkSpeed or humanoid.WalkSpeed
+                                                            humanoid.PlatformStand = followLockPrevPlatformStand or humanoid.PlatformStand
+                                                            followLockPrevWalkSpeed = nil
+                                                            followLockPrevPlatformStand = nil
+                                                        end
+                                                    end)
+                                                    return
+                                                end
+                                                local updatedPivotLocal = closestMob:GetPivot()
+                                                local hrp = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                                                if updatedPivotLocal and hrp then
+                                                    local desiredPosLocal = updatedPivotLocal.Position + (updatedPivotLocal.LookVector * distanceOffset) + Vector3.new(0, heightOffset, 0)
+                                                    local distLocal = (desiredPosLocal - hrp.Position).Magnitude
+                                                    if distLocal > 0.05 then
+                                                        if followLockTween then followLockTween:Cancel(); followLockTween = nil end
+                                                        local tweenTimeLocal = math.max(distLocal / movementSpeed, 0.05)
+                                                        followLockTween = TweenService:Create(hrp, TweenInfo.new(tweenTimeLocal, Enum.EasingStyle.Linear), {CFrame = CFrame.new(desiredPosLocal, updatedPivotLocal.Position)})
+                                                        followLockTween:Play()
+                                                    end
+                                                end
+                                            end)
+                                            currentTargetSkyY = nil
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                end
+            end)
+        end)
+    end
+
+    -- Farming Configurations Section
+    AutoFarmTab:Section({ Title = 'Farming Configurations', Collapsible = true })
+
+    AutoFarmTab:CreateSlider({
+        Title = 'Farming Configurations',
+        Description = 'Adjust farming parameters',
+        Sliders = {
+            {
+                Title = 'Speed',
+                Range = {1, 300},
+                Increment = 1,
+                StarterValue = 16,
+                CallBack = function(value)
+                    movementSpeed = value
+                end,
+            },
+            {
+                Title = 'Distance Offset',
+                Range = {-10, 20},
+                Increment = 1,
+                StarterValue = 5,
+                CallBack = function(value)
+                    distanceOffset = value
+                end,
+            },
+            {
+                Title = 'Height Offset',
+                Range = {-10, 20},
+                Increment = 1,
+                StarterValue = 0,
+                CallBack = function(value)
+                    heightOffset = value
+                end,
+            }
+        }
+    })
+
+    AutoFarmTab:Dropdown({
+        Title = 'Farming Mode',
+        Options = {'Tween', 'Teleport'},
+        Default = 'Tween',
+        CallBack = function(value)
+            farmingMode = value
+        end,
+    })
+
+    AutoFarmTab:Toggle({
+        Title = 'Look At Mob',
+        Value = false,
+        CallBack = function(v)
+            lookAtMobEnabled = v
+        end,
+    })
+
+    -- Mob Farming Section
+    AutoFarmTab:Section({ Title = 'Mob Farming', Collapsible = true })
+
+    AutoFarmTab:Paragraph({
+        Title = 'Mob Priority Info',
+        Content = 'Pick mobs for each priority level. The system targets Priority 1 mobs first, then Priority 2, then 3, and finally Other mobs if none from higher levels are around.'
+    })
+
+    AutoFarmTab:Dropdown({
+        Title = 'Priority 1 Mobs',
+        Options = isForgeWorld2 and world2Mobs or world1Mobs,
+        PlaceHolder = 'Select highest priority mobs...',
+        Multi = true,
+        CallBack = function(selected)
+            priorityMobs1 = selected
+        end,
+    })
+
+    AutoFarmTab:Dropdown({
+        Title = 'Priority 2 Mobs',
+        Options = isForgeWorld2 and world2Mobs or world1Mobs,
+        PlaceHolder = 'Select medium priority mobs...',
+        Multi = true,
+        CallBack = function(selected)
+            priorityMobs2 = selected
+        end,
+    })
+
+    AutoFarmTab:Dropdown({
+        Title = 'Priority 3 Mobs',
+        Options = isForgeWorld2 and world2Mobs or world1Mobs,
+        PlaceHolder = 'Select low priority mobs...',
+        Multi = true,
+        CallBack = function(selected)
+            priorityMobs3 = selected
+        end,
+    })
+
+    AutoFarmTab:Dropdown({
+        Title = 'Other Mobs',
+        Options = isForgeWorld2 and world2Mobs or world1Mobs,
+        PlaceHolder = 'Select other mobs to target...',
+        Multi = true,
+        CallBack = function(selected)
+            otherMobs = selected
+        end,
+    })
+
+    AutoFarmTab:Toggle({
+        Title = 'Auto Kill Mob',
+        Value = false,
+        CallBack = function(v)
+            autoKillEnabled = v
+            if v then
+                startAutoKill()
+            else
+                stopAutoKill()
+            end
+        end,
+    })
+
+    -- Add more sections here as needed
+
+end
+
+return initAutoFarmTab
